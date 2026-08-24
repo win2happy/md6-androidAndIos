@@ -1,12 +1,15 @@
 import UIKit
 import Capacitor
 import WebKit
+import UserNotifications
 
 /**
  * MD6 App AppDelegate
  * 
- * 扩展 Capacitor AppDelegate，注入 File System Access API Polyfill
- * 使远程网页在 iOS WKWebView 中支持 FS Access API
+ * 扩展 Capacitor AppDelegate：
+ * 1. 注册 FSAccess 原生插件（UIDocumentPickerViewController）
+ * 2. 注入 FS Access API Polyfill 到 WKWebView
+ * 3. 请求通知权限
  */
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -14,7 +17,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-        // Override point for customization after application launch.
+        // 请求通知权限
+        requestNotificationPermissions()
         return true
     }
 
@@ -39,13 +43,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
-        // Called when the app was opened with a url. Feel free to add additional processing here.
         return ApplicationDelegateProxy.shared.application(app, open: url, options: options)
     }
 
     func application(_ application: UIApplication, continue userActivity: NSUserActivity, restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void) -> Bool {
-        // Called when the app was launched with an activity, including Universal Links.
         return ApplicationDelegateProxy.shared.application(application, continue: userActivity, restorationHandler: restorationHandler)
+    }
+
+    // ============================================================
+    // 通知权限请求
+    // ============================================================
+
+    private func requestNotificationPermissions() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
+            if granted {
+                print("[MD6-iOS] 通知权限已授予")
+                DispatchQueue.main.async {
+                    UIApplication.shared.registerForRemoteNotifications()
+                }
+            } else {
+                print("[MD6-iOS] 通知权限被拒绝")
+            }
+            if let error = error {
+                print("[MD6-iOS] 通知权限请求错误: \(error)")
+            }
+        }
     }
 }
 
@@ -54,7 +76,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 // ============================================================
 
 /**
- * CapacitorBridge 扩展：注入 FS Access API Polyfill
+ * CAPBridgeViewController 扩展：注入 FS Access API Polyfill
  * 
  * 使用 WKUserScript 在页面加载前注入 JavaScript，
  * 确保远程网页可以使用 File System Access API
@@ -92,7 +114,7 @@ extension CAPBridgeViewController {
         print("[MD6-iOS] File System Access API Polyfill 已注入 WebView")
     }
 
-    /// FS Access API Polyfill JavaScript 代码
+    /// FS Access API Polyfill JavaScript 代码 - 使用 FSAccess 原生插件
     private func getFileSystemPolyfillScript() -> String {
         return """
         (function() {
@@ -100,113 +122,104 @@ extension CAPBridgeViewController {
           if (window.__fsPolyfillInjected) return;
           window.__fsPolyfillInjected = true;
 
-          // 等待 Capacitor 就绪
+          // 等待 Capacitor FSAccess 插件就绪
           function waitForCapacitor(callback) {
-            if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Filesystem) {
+            if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.FSAccess) {
               callback();
             } else {
               var interval = setInterval(function() {
-                if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Filesystem) {
+                if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.FSAccess) {
                   clearInterval(interval);
                   callback();
                 }
               }, 100);
-              // 超时 5 秒后放弃
               setTimeout(function() { clearInterval(interval); }, 5000);
             }
           }
 
           waitForCapacitor(function() {
-            console.log('[FS-Polyfill] Capacitor 就绪，安装 File System Access API Polyfill (iOS)');
+            console.log('[FS-Polyfill] Capacitor FSAccess 插件就绪 (iOS)，安装 File System Access API Polyfill');
 
-            var Filesystem = window.Capacitor.Plugins.Filesystem;
+            var FSAccess = window.Capacitor.Plugins.FSAccess;
 
-            // 如果浏览器已原生支持，跳过
-            if (window.showOpenFilePicker && window.showSaveFilePicker && window.showDirectoryPicker) {
-              console.log('[FS-Polyfill] 浏览器已原生支持 FS Access API');
-              return;
-            }
+            // URI 到 Handle 的映射
+            var handleMap = new Map();
 
-            // 简化的 Base64 编解码
-            function uint8ToBase64(u8) {
-              var b = '';
-              for (var i = 0; i < u8.length; i++) b += String.fromCharCode(u8[i]);
-              return btoa(b);
-            }
-            function base64ToUint8(b64) {
-              var b = atob(b64);
-              var u8 = new Uint8Array(b.length);
-              for (var i = 0; i < b.length; i++) u8[i] = b.charCodeAt(i);
-              return u8;
-            }
-
-            // FileSystemFileHandle
-            function FSFileHandle(path, dir, name) {
+            // FileSystemFileHandle (SAF URI 版)
+            function FSFileHandle(uri, name, size) {
               this.kind = 'file';
-              this._path = path;
-              this._dir = dir || 'DOCUMENTS';
-              this._name = name || path.split('/').pop();
+              this._uri = uri;
+              this._name = name || 'unknown';
+              this._size = size || 0;
+              handleMap.set(uri, this);
             }
             FSFileHandle.prototype.getFile = function() {
-              return Filesystem.readFile({path: this._path, directory: this._dir}).then(function(r) {
-                var data = base64ToUint8(r.data);
+              return FSAccess.readFile({uri: this._uri}).then(function(r) {
+                var data = Uint8Array.from(atob(r.data), function(c) { return c.charCodeAt(0); });
+                this._size = data.length;
                 return new File([data], this._name, {type: 'application/octet-stream'});
               }.bind(this));
             };
             FSFileHandle.prototype.createWritable = function() {
               var self = this;
+              var chunks = [];
               return Promise.resolve({
-                write: function(data) { this._data = data; }.bind(this),
+                write: function(data) {
+                  if (typeof data === 'string') data = new TextEncoder().encode(data);
+                  if (data instanceof Uint8Array) chunks.push(data);
+                },
                 close: function() {
-                  var d = this._data;
-                  if (typeof d === 'string') d = new TextEncoder().encode(d);
-                  return Filesystem.writeFile({path: self._path, data: uint8ToBase64(d), directory: self._dir, recursive: true});
-                }.bind(this)
+                  var total = chunks.reduce(function(a, c) { return a + c.length; }, 0);
+                  var combined = new Uint8Array(total);
+                  var off = 0;
+                  chunks.forEach(function(c) { combined.set(c, off); off += c.length; });
+                  var b64 = btoa(String.fromCharCode.apply(null, combined));
+                  return FSAccess.writeFile({uri: self._uri, data: b64});
+                }
               });
             };
             FSFileHandle.prototype.isSameEntry = function(other) {
-              return other instanceof FSFileHandle && other._path === this._path;
+              return other instanceof FSFileHandle && other._uri === this._uri;
             };
 
-            // FileSystemDirectoryHandle
-            function FSDirHandle(path, dir, name) {
+            // FileSystemDirectoryHandle (SAF URI 版)
+            function FSDirHandle(uri, name) {
               this.kind = 'directory';
-              this._path = path;
-              this._dir = dir || 'DOCUMENTS';
-              this._name = name || 'Documents';
+              this._uri = uri;
+              this._name = name || 'Directory';
+              handleMap.set(uri, this);
             }
             FSDirHandle.prototype.getFileHandle = function(name, opts) {
-              var p = this._path ? this._path + '/' + name : name;
-              return Promise.resolve(new FSFileHandle(p, this._dir, name));
+              return FSAccess.listDirectory({uri: this._uri}).then(function(r) {
+                var found = (r.entries || []).find(function(e) { return e.name === name && e.type === 'file'; });
+                if (found) return new FSFileHandle(found.uri, found.name, found.size);
+                throw new DOMException('File not found: ' + name, 'NotFoundError');
+              });
             };
             FSDirHandle.prototype.getDirectoryHandle = function(name, opts) {
-              var p = this._path ? this._path + '/' + name : name;
-              if (opts && opts.create) {
-                return Filesystem.mkdir({path: p, directory: this._dir, recursive: true}).then(function() {
-                  return new FSDirHandle(p, this._dir, name);
-                }.bind(this), function() { return new FSDirHandle(p, this._dir, name); });
-              }
-              return Promise.resolve(new FSDirHandle(p, this._dir, name));
+              return FSAccess.listDirectory({uri: this._uri}).then(function(r) {
+                var found = (r.entries || []).find(function(e) { return e.name === name && e.type === 'directory'; });
+                if (found) return new FSDirHandle(found.uri, found.name);
+                throw new DOMException('Directory not found: ' + name, 'NotFoundError');
+              });
             };
             FSDirHandle.prototype.removeEntry = function(name, opts) {
-              var p = this._path ? this._path + '/' + name : name;
-              return Filesystem.deleteFile({path: p, directory: this._dir}).catch(function() {
-                return Filesystem.rmdir({path: p, directory: this._dir, recursive: !!(opts && opts.recursive)});
-              });
+              return Promise.reject(new DOMException('Not supported with document picker', 'NotSupportedError'));
             };
             FSDirHandle.prototype.values = function() {
               var self = this;
               var entries = [];
               var index = 0;
+              var loaded = false;
               return {
                 next: function() {
-                  if (entries.length === 0 && index === 0) {
-                    return Filesystem.readdir({path: self._path || '.', directory: self._dir}).then(function(r) {
-                      entries = r.files.map(function(f) {
-                        var p = self._path ? self._path + '/' + f.name : f.name;
-                        return f.type === 'directory' ? new FSDirHandle(p, self._dir, f.name) : new FSFileHandle(p, self._dir, f.name);
+                  if (!loaded) {
+                    return FSAccess.listDirectory({uri: self._uri}).then(function(r) {
+                      loaded = true;
+                      var arr = r.entries || [];
+                      entries = arr.map(function(e) {
+                        return e.type === 'directory' ? new FSDirHandle(e.uri, e.name) : new FSFileHandle(e.uri, e.name, e.size);
                       });
-                      index = 0;
                       if (entries.length > 0) return {value: entries[index++], done: false};
                       return {value: undefined, done: true};
                     });
@@ -218,35 +231,53 @@ extension CAPBridgeViewController {
               };
             };
             FSDirHandle.prototype.isSameEntry = function(other) {
-              return other instanceof FSDirHandle && other._path === this._path;
+              return other instanceof FSDirHandle && other._uri === this._uri;
             };
 
-            // 注册全局 API
-            window.showOpenFilePicker = function(opts) {
-              return Filesystem.readdir({path: '.', directory: 'DOCUMENTS'}).then(function(r) {
-                var files = r.files.filter(function(f) { return f.type !== 'directory'; });
-                if (files.length === 0) return [];
-                return [new FSFileHandle(files[0].name, 'DOCUMENTS', files[0].name)];
+            // showDirectoryPicker - 使用 UIDocumentPickerViewController
+            window.showDirectoryPicker = function(opts) {
+              var mode = (opts && opts.mode) || 'read';
+              return FSAccess.showDirectoryPicker({mode: mode}).then(function(r) {
+                if (r.cancelled) throw new DOMException('User cancelled', 'AbortError');
+                return new FSDirHandle(r.uri, r.name);
               });
             };
+
+            // showOpenFilePicker - 使用 UIDocumentPickerViewController
+            window.showOpenFilePicker = function(opts) {
+              var multiple = (opts && opts.multiple) || false;
+              return FSAccess.showOpenFilePicker({multiple: multiple}).then(function(r) {
+                if (r.cancelled) throw new DOMException('User cancelled', 'AbortError');
+                var files = (r.files || []).map(function(f) {
+                  return new FSFileHandle(f.uri, f.name, f.size);
+                });
+                return files;
+              });
+            };
+
+            // showSaveFilePicker - 使用 UIDocumentPickerViewController
             window.showSaveFilePicker = function(opts) {
-              var name = (opts && opts.suggestedName) || 'untitled.txt';
-              return Promise.resolve(new FSFileHandle(name, 'DOCUMENTS', name));
+              var suggestedName = (opts && opts.suggestedName) || 'untitled.txt';
+              return FSAccess.showSaveFilePicker({suggestedName: suggestedName}).then(function(r) {
+                if (r.cancelled) throw new DOMException('User cancelled', 'AbortError');
+                return new FSFileHandle(r.uri, r.name);
+              });
             };
-            window.showDirectoryPicker = function() {
-              return Promise.resolve(new FSDirHandle('', 'DOCUMENTS', 'Documents'));
-            };
+
             window.FileSystemFileHandle = FSFileHandle;
             window.FileSystemDirectoryHandle = FSDirHandle;
 
             // StorageManager.getDirectory polyfill
             if (navigator.storage && !navigator.storage.getDirectory) {
               navigator.storage.getDirectory = function() {
-                return Promise.resolve(new FSDirHandle('', 'DOCUMENTS', 'Documents'));
+                return FSAccess.getPersistedUri().then(function(r) {
+                  if (r.uri) return new FSDirHandle(r.uri, 'Persisted Directory');
+                  throw new DOMException('No persisted directory', 'NotFoundError');
+                });
               };
             }
 
-            console.log('[FS-Polyfill] File System Access API Polyfill 安装完成 (iOS)');
+            console.log('[FS-Polyfill] File System Access API Polyfill (iOS DocumentPicker) 安装完成');
             window.dispatchEvent(new CustomEvent('fs-polyfill-ready'));
           });
         })();

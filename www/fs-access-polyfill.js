@@ -1,13 +1,13 @@
 /**
  * File System Access API Polyfill for Capacitor
  * 
- * 桥接 Web File System Access API 到 Capacitor Filesystem 插件
- * 在 Android/iOS 上提供与桌面浏览器一致的文件操作体验
+ * 优先使用 FSAccess 原生插件（Android SAF / iOS UIDocumentPicker）
+ * 回退到 Capacitor Filesystem 插件（仅限 Documents 目录操作）
  * 
  * 支持的 API:
- * - window.showOpenFilePicker()
- * - window.showSaveFilePicker()
- * - window.showDirectoryPicker()
+ * - window.showOpenFilePicker()  → SAF 文件选择器
+ * - window.showSaveFilePicker()  → SAF 保存选择器
+ * - window.showDirectoryPicker() → SAF 目录选择器
  * - FileSystemFileHandle / FileSystemDirectoryHandle
  * - FileSystemWritableFileStream
  */
@@ -31,24 +31,47 @@
 
   console.log('[FS-Polyfill] 初始化 Capacitor File System Access API Polyfill');
 
-  // 动态导入 Capacitor 插件
-  let Filesystem, Share, Dialog;
-  try {
-    const fs = await import('@capacitor/filesystem');
-    Filesystem = fs.Filesystem;
-    const share = await import('@capacitor/share');
-    Share = share.Share;
-    const dialog = await import('@capacitor/dialog');
-    Dialog = dialog.Dialog;
-  } catch (e) {
-    // 回退：使用全局 Capacitor 插件
+  // ============================================================
+  // 插件加载 - 优先 FSAccess 原生插件，回退 Filesystem
+  // ============================================================
+
+  let FSAccess = null;
+  let Filesystem = null;
+
+  // 等待 Capacitor 插件就绪
+  async function waitForPlugins() {
+    const maxWait = 5000;
+    const interval = 100;
+    let elapsed = 0;
+
+    while (elapsed < maxWait) {
+      if (window.Capacitor && window.Capacitor.Plugins) {
+        FSAccess = window.Capacitor.Plugins.FSAccess || null;
+        Filesystem = window.Capacitor.Plugins.Filesystem || null;
+        if (FSAccess || Filesystem) return;
+      }
+      await new Promise(r => setTimeout(r, interval));
+      elapsed += interval;
+    }
+    console.warn('[FS-Polyfill] 等待 Capacitor 插件超时');
+  }
+
+  await waitForPlugins();
+
+  const useNativePicker = !!FSAccess;
+  console.log('[FS-Polyfill] 使用原生选择器:', useNativePicker ? 'FSAccess (SAF)' : '回退 Filesystem');
+
+  // 动态导入 Capacitor Filesystem（回退方案）
+  if (!Filesystem) {
     try {
-      Filesystem = Capacitor.Plugins.Filesystem || Capacitor.Plugins.Filesystem;
-      Share = Capacitor.Plugins.Share;
-      Dialog = Capacitor.Plugins.Dialog;
-    } catch (e2) {
-      console.warn('[FS-Polyfill] 无法加载 Capacitor 插件:', e2);
-      return;
+      const fs = await import('@capacitor/filesystem');
+      Filesystem = fs.Filesystem;
+    } catch (e) {
+      try {
+        Filesystem = Capacitor.Plugins.Filesystem;
+      } catch (e2) {
+        console.warn('[FS-Polyfill] 无法加载 Capacitor Filesystem 插件:', e2);
+      }
     }
   }
 
@@ -59,16 +82,6 @@
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
-  /**
-   * 生成唯一 ID
-   */
-  function generateId() {
-    return 'fs-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
-  }
-
-  /**
-   * Base64 编码
-   */
   function uint8ArrayToBase64(uint8Array) {
     let binary = '';
     for (let i = 0; i < uint8Array.length; i++) {
@@ -77,9 +90,6 @@
     return btoa(binary);
   }
 
-  /**
-   * Base64 解码
-   */
   function base64ToUint8Array(base64) {
     const binary = atob(base64);
     const uint8Array = new Uint8Array(binary.length);
@@ -89,447 +99,391 @@
     return uint8Array;
   }
 
-  /**
-   * 从 Capacitor Filesystem 路径中提取文件名
-   */
-  function getFileName(path) {
-    const parts = path.split('/');
-    return parts[parts.length - 1];
-  }
-
-  /**
-   * 获取文件扩展名
-   */
-  function getFileExtension(filename) {
-    const parts = filename.split('.');
-    return parts.length > 1 ? parts[parts.length - 1] : '';
-  }
-
-  /**
-   * MIME 类型映射
-   */
-  function getMimeType(filename) {
-    const ext = getFileExtension(filename).toLowerCase();
-    const mimeMap = {
-      'txt': 'text/plain',
-      'json': 'application/json',
-      'js': 'text/javascript',
-      'ts': 'text/typescript',
-      'html': 'text/html',
-      'css': 'text/css',
-      'md': 'text/markdown',
-      'csv': 'text/csv',
-      'xml': 'text/xml',
-      'png': 'image/png',
-      'jpg': 'image/jpeg',
-      'jpeg': 'image/jpeg',
-      'gif': 'image/gif',
-      'svg': 'image/svg+xml',
-      'webp': 'image/webp',
-      'pdf': 'application/pdf',
-      'zip': 'application/zip',
-      'doc': 'application/msword',
-      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'xls': 'application/vnd.ms-excel',
-      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    };
-    return mimeMap[ext] || 'application/octet-stream';
-  }
-
   // ============================================================
-  // 文件句柄存储
+  // SAF 版本 - 使用 FSAccess 原生插件的 Handle
   // ============================================================
 
-  /**
-   * 文件句柄注册表 - 存储已打开的文件/目录引用
-   */
-  const handleRegistry = new Map();
+  if (useNativePicker) {
 
-  // ============================================================
-  // FileSystemWritableFileStream
-  // ============================================================
-
-  class FileSystemWritableFileStream extends WritableStream {
-    constructor(fileHandle, keepExistingData) {
-      super({
-        start(controller) {
-          this._fileHandle = fileHandle;
-          this._keepExistingData = keepExistingData;
-          this._chunks = [];
-          this._position = 0;
-        },
-        write(chunk) {
-          if (chunk instanceof Uint8Array) {
-            this._chunks.push(chunk);
-            this._position += chunk.length;
-          } else if (typeof chunk === 'string') {
-            const encoded = encoder.encode(chunk);
-            this._chunks.push(encoded);
-            this._position += encoded.length;
-          } else if (chunk && chunk.type === 'seek') {
-            this._position = chunk.position;
-          } else if (chunk && chunk.type === 'truncate') {
-            // 简化实现：截断操作
-            this._chunks = this._chunks.slice(0, chunk.size);
-          }
-        },
-        async close() {
-          try {
-            // 合并所有 chunks
-            const totalLength = this._chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-            const combined = new Uint8Array(totalLength);
-            let offset = 0;
-            for (const chunk of this._chunks) {
-              combined.set(chunk, offset);
-              offset += chunk.length;
-            }
-
-            const base64Data = uint8ArrayToBase64(combined);
-
-            await Filesystem.writeFile({
-              path: this._fileHandle._path,
-              data: base64Data,
-              directory: this._fileHandle._directory,
-              recursive: true,
-            });
-
-            this._fileHandle._size = totalLength;
-          } catch (err) {
-            console.error('[FS-Polyfill] 写入文件失败:', err);
-            throw err;
-          }
-        },
-        abort(reason) {
-          this._chunks = [];
-          console.warn('[FS-Polyfill] 写入流被中止:', reason);
-        },
-      });
-    }
-  }
-
-  // ============================================================
-  // FileSystemFileHandle
-  // ============================================================
-
-  class FileSystemFileHandle {
-    constructor(path, directory, name) {
-      this.kind = 'file';
-      this._path = path;
-      this._directory = directory || 'DOCUMENTS';
-      this._name = name || getFileName(path);
-      this._id = generateId();
-      this._size = 0;
-      this._lastModified = Date.now();
-      handleRegistry.set(this._id, this);
-    }
-
-    get name() {
-      return this._name;
-    }
-
-    async getFile() {
-      try {
-        const result = await Filesystem.readFile({
-          path: this._path,
-          directory: this._directory,
-        });
-
-        // Capacitor readFile 返回 base64 或 string
-        let data;
-        if (typeof result.data === 'string') {
-          try {
-            data = base64ToUint8Array(result.data);
-          } catch {
-            data = encoder.encode(result.data);
-          }
-        }
-
-        this._size = data ? data.length : 0;
-
-        const file = new File([data], this._name, {
-          type: getMimeType(this._name),
-          lastModified: this._lastModified,
-        });
-
-        return file;
-      } catch (err) {
-        console.error('[FS-Polyfill] 读取文件失败:', err);
-        throw new DOMException('File not found', 'NotFoundError');
+    // --- SAF FileSystemFileHandle ---
+    class SAFFileHandle {
+      constructor(uri, name, size) {
+        this.kind = 'file';
+        this._uri = uri;
+        this._name = name || 'unknown';
+        this._size = size || 0;
       }
-    }
 
-    async createWritable({ keepExistingData = false } = {}) {
-      return new FileSystemWritableFileStream(this, keepExistingData);
-    }
+      get name() { return this._name; }
 
-    async isSameEntry(other) {
-      return other instanceof FileSystemFileHandle &&
-        other._path === this._path &&
-        other._directory === this._directory;
-    }
-
-    async remove() {
-      try {
-        await Filesystem.deleteFile({
-          path: this._path,
-          directory: this._directory,
-        });
-        handleRegistry.delete(this._id);
-      } catch (err) {
-        throw new DOMException('Failed to remove file', 'InvalidStateError');
-      }
-    }
-  }
-
-  // ============================================================
-  // FileSystemDirectoryHandle
-  // ============================================================
-
-  class FileSystemDirectoryHandle {
-    constructor(path, directory, name) {
-      this.kind = 'directory';
-      this._path = path;
-      this._directory = directory || 'DOCUMENTS';
-      this._name = name || getFileName(path) || 'Documents';
-      this._id = generateId();
-      handleRegistry.set(this._id, this);
-    }
-
-    get name() {
-      return this._name;
-    }
-
-    async getFileHandle(name, { create = false } = {}) {
-      const childPath = this._path ? `${this._path}/${name}` : name;
-
-      if (!create) {
-        // 检查文件是否存在
+      async getFile() {
         try {
-          await Filesystem.stat({
-            path: childPath,
-            directory: this._directory,
+          const result = await FSAccess.readFile({ uri: this._uri });
+          const data = base64ToUint8Array(result.data);
+          this._size = data.length;
+          return new File([data], this._name, {
+            type: 'application/octet-stream',
+            lastModified: Date.now(),
           });
-        } catch {
+        } catch (err) {
+          console.error('[FS-Polyfill] SAF readFile 失败:', err);
           throw new DOMException('File not found', 'NotFoundError');
         }
       }
 
-      return new FileSystemFileHandle(childPath, this._directory, name);
+      async createWritable({ keepExistingData = false } = {}) {
+        const self = this;
+        const chunks = [];
+        return {
+          write(data) {
+            if (typeof data === 'string') data = encoder.encode(data);
+            if (data instanceof Uint8Array) chunks.push(data);
+          },
+          async close() {
+            const total = chunks.reduce((a, c) => a + c.length, 0);
+            const combined = new Uint8Array(total);
+            let off = 0;
+            chunks.forEach(c => { combined.set(c, off); off += c.length; });
+            const b64 = uint8ArrayToBase64(combined);
+            await FSAccess.writeFile({ uri: self._uri, data: b64 });
+            self._size = total;
+          },
+          abort(reason) {
+            chunks.length = 0;
+          },
+        };
+      }
+
+      async isSameEntry(other) {
+        return other instanceof SAFFileHandle && other._uri === this._uri;
+      }
+
+      async remove() {
+        throw new DOMException('Remove not supported with SAF', 'NotSupportedError');
+      }
     }
 
-    async getDirectoryHandle(name, { create = false } = {}) {
-      const childPath = this._path ? `${this._path}/${name}` : name;
+    // --- SAF FileSystemDirectoryHandle ---
+    class SAFDirectoryHandle {
+      constructor(uri, name) {
+        this.kind = 'directory';
+        this._uri = uri;
+        this._name = name || 'Directory';
+      }
 
-      if (create) {
-        try {
-          await Filesystem.mkdir({
-            path: childPath,
-            directory: this._directory,
-            recursive: true,
-          });
-        } catch {
-          // 目录可能已存在
+      get name() { return this._name; }
+
+      async getFileHandle(name, { create = false } = {}) {
+        // SAF 不支持通过名称直接获取子文件句柄
+        // 需要先列出目录内容再匹配
+        const entries = await this._listEntries();
+        const found = entries.find(e => e.name === name && e.type === 'file');
+        if (found) return new SAFFileHandle(found.uri, found.name, found.size);
+        if (create) {
+          throw new DOMException('Cannot create file via SAF directly. Use showSaveFilePicker instead.', 'NotSupportedError');
         }
-      } else {
+        throw new DOMException('File not found: ' + name, 'NotFoundError');
+      }
+
+      async getDirectoryHandle(name, { create = false } = {}) {
+        const entries = await this._listEntries();
+        const found = entries.find(e => e.name === name && e.type === 'directory');
+        if (found) return new SAFDirectoryHandle(found.uri, found.name);
+        if (create) {
+          throw new DOMException('Cannot create directory via SAF directly.', 'NotSupportedError');
+        }
+        throw new DOMException('Directory not found: ' + name, 'NotFoundError');
+      }
+
+      async removeEntry(name, { recursive = false } = {}) {
+        throw new DOMException('Remove not supported with SAF', 'NotSupportedError');
+      }
+
+      async _listEntries() {
         try {
-          const stat = await Filesystem.stat({
-            path: childPath,
+          const result = await FSAccess.listDirectory({ uri: this._uri });
+          return result.entries || [];
+        } catch (err) {
+          console.error('[FS-Polyfill] SAF listDirectory 失败:', err);
+          return [];
+        }
+      }
+
+      async *values() {
+        const entries = await this._listEntries();
+        for (const entry of entries) {
+          if (entry.type === 'directory') {
+            yield new SAFDirectoryHandle(entry.uri, entry.name);
+          } else {
+            yield new SAFFileHandle(entry.uri, entry.name, entry.size);
+          }
+        }
+      }
+
+      async *entries() {
+        for await (const handle of this.values()) {
+          yield [handle.name, handle];
+        }
+      }
+
+      async *keys() {
+        for await (const [name] of this.entries()) {
+          yield name;
+        }
+      }
+
+      async isSameEntry(other) {
+        return other instanceof SAFDirectoryHandle && other._uri === this._uri;
+      }
+
+      [Symbol.asyncIterator]() {
+        return this.values();
+      }
+    }
+
+    // ============================================================
+    // SAF 版全局 API
+    // ============================================================
+
+    window.showDirectoryPicker = async function (options = {}) {
+      const mode = options.mode || 'read';
+      const result = await FSAccess.showDirectoryPicker({ mode });
+
+      if (result.cancelled) {
+        throw new DOMException('User cancelled', 'AbortError');
+      }
+
+      return new SAFDirectoryHandle(result.uri, result.name);
+    };
+
+    window.showOpenFilePicker = async function (options = {}) {
+      const multiple = options.multiple || false;
+      const result = await FSAccess.showOpenFilePicker({ multiple });
+
+      if (result.cancelled) {
+        throw new DOMException('User cancelled', 'AbortError');
+      }
+
+      const files = (result.files || []).map(f =>
+        new SAFFileHandle(f.uri, f.name, f.size)
+      );
+
+      return files;
+    };
+
+    window.showSaveFilePicker = async function (options = {}) {
+      const suggestedName = options.suggestedName || 'untitled.txt';
+      const result = await FSAccess.showSaveFilePicker({ suggestedName });
+
+      if (result.cancelled) {
+        throw new DOMException('User cancelled', 'AbortError');
+      }
+
+      return new SAFFileHandle(result.uri, result.name);
+    };
+
+    window.FileSystemFileHandle = SAFFileHandle;
+    window.FileSystemDirectoryHandle = SAFDirectoryHandle;
+
+    // StorageManager.getDirectory polyfill - 返回持久化的目录
+    if (navigator.storage && !navigator.storage.getDirectory) {
+      navigator.storage.getDirectory = async function () {
+        const result = await FSAccess.getPersistedUri();
+        if (result.uri) {
+          return new SAFDirectoryHandle(result.uri, 'Persisted Directory');
+        }
+        throw new DOMException('No persisted directory', 'NotFoundError');
+      };
+    }
+
+  } else {
+    // ============================================================
+    // 回退方案 - 使用 Capacitor Filesystem（仅 Documents 目录）
+    // ============================================================
+
+    if (!Filesystem) {
+      console.error('[FS-Polyfill] 没有 FSAccess 也没有 Filesystem 插件，无法提供 polyfill');
+      return;
+    }
+
+    // --- Fallback FileSystemFileHandle ---
+    class FallbackFileHandle {
+      constructor(path, directory, name) {
+        this.kind = 'file';
+        this._path = path;
+        this._directory = directory || 'DOCUMENTS';
+        this._name = name || path.split('/').pop();
+        this._size = 0;
+      }
+
+      get name() { return this._name; }
+
+      async getFile() {
+        try {
+          const result = await Filesystem.readFile({
+            path: this._path,
             directory: this._directory,
           });
-          if (stat.type !== 'directory') {
-            throw new DOMException('Not a directory', 'TypeMismatchError');
+          let data;
+          if (typeof result.data === 'string') {
+            try { data = base64ToUint8Array(result.data); }
+            catch { data = encoder.encode(result.data); }
+          }
+          this._size = data ? data.length : 0;
+          return new File([data], this._name, {
+            type: 'application/octet-stream',
+            lastModified: Date.now(),
+          });
+        } catch (err) {
+          throw new DOMException('File not found', 'NotFoundError');
+        }
+      }
+
+      async createWritable({ keepExistingData = false } = {}) {
+        const self = this;
+        const chunks = [];
+        return {
+          write(data) {
+            if (typeof data === 'string') data = encoder.encode(data);
+            if (data instanceof Uint8Array) chunks.push(data);
+          },
+          async close() {
+            const total = chunks.reduce((a, c) => a + c.length, 0);
+            const combined = new Uint8Array(total);
+            let off = 0;
+            chunks.forEach(c => { combined.set(c, off); off += c.length; });
+            await Filesystem.writeFile({
+              path: self._path,
+              data: uint8ArrayToBase64(combined),
+              directory: self._directory,
+              recursive: true,
+            });
+            self._size = total;
+          },
+          abort() { chunks.length = 0; },
+        };
+      }
+
+      async isSameEntry(other) {
+        return other instanceof FallbackFileHandle &&
+          other._path === this._path &&
+          other._directory === this._directory;
+      }
+    }
+
+    // --- Fallback FileSystemDirectoryHandle ---
+    class FallbackDirectoryHandle {
+      constructor(path, directory, name) {
+        this.kind = 'directory';
+        this._path = path;
+        this._directory = directory || 'DOCUMENTS';
+        this._name = name || 'Documents';
+      }
+
+      get name() { return this._name; }
+
+      async getFileHandle(name, { create = false } = {}) {
+        const childPath = this._path ? `${this._path}/${name}` : name;
+        if (!create) {
+          try {
+            await Filesystem.stat({ path: childPath, directory: this._directory });
+          } catch {
+            throw new DOMException('File not found', 'NotFoundError');
+          }
+        }
+        return new FallbackFileHandle(childPath, this._directory, name);
+      }
+
+      async getDirectoryHandle(name, { create = false } = {}) {
+        const childPath = this._path ? `${this._path}/${name}` : name;
+        if (create) {
+          try {
+            await Filesystem.mkdir({ path: childPath, directory: this._directory, recursive: true });
+          } catch { /* 目录可能已存在 */ }
+        }
+        return new FallbackDirectoryHandle(childPath, this._directory, name);
+      }
+
+      async removeEntry(name, { recursive = false } = {}) {
+        const childPath = this._path ? `${this._path}/${name}` : name;
+        try {
+          await Filesystem.deleteFile({ path: childPath, directory: this._directory });
+        } catch {
+          await Filesystem.rmdir({ path: childPath, directory: this._directory, recursive });
+        }
+      }
+
+      async *values() {
+        try {
+          const result = await Filesystem.readdir({
+            path: this._path || '.',
+            directory: this._directory,
+          });
+          for (const entry of result.files) {
+            const childPath = this._path ? `${this._path}/${entry.name}` : entry.name;
+            if (entry.type === 'directory') {
+              yield new FallbackDirectoryHandle(childPath, this._directory, entry.name);
+            } else {
+              yield new FallbackFileHandle(childPath, this._directory, entry.name);
+            }
           }
         } catch (err) {
-          if (err instanceof DOMException) throw err;
-          throw new DOMException('Directory not found', 'NotFoundError');
+          console.error('[FS-Polyfill] 回退 readdir 失败:', err);
         }
       }
 
-      return new FileSystemDirectoryHandle(childPath, this._directory, name);
-    }
-
-    async removeEntry(name, { recursive = false } = {}) {
-      const childPath = this._path ? `${this._path}/${name}` : name;
-
-      try {
-        const stat = await Filesystem.stat({
-          path: childPath,
-          directory: this._directory,
-        });
-
-        if (stat.type === 'directory') {
-          await Filesystem.rmdir({
-            path: childPath,
-            directory: this._directory,
-            recursive,
-          });
-        } else {
-          await Filesystem.deleteFile({
-            path: childPath,
-            directory: this._directory,
-          });
+      async *entries() {
+        for await (const handle of this.values()) {
+          yield [handle.name, handle];
         }
-      } catch (err) {
-        throw new DOMException('Failed to remove entry', 'InvalidStateError');
       }
-    }
 
-    async *values() {
-      try {
-        const result = await Filesystem.readdir({
-          path: this._path || '.',
-          directory: this._directory,
-        });
-
-        for (const entry of result.files) {
-          if (entry.type === 'directory') {
-            yield new FileSystemDirectoryHandle(
-              this._path ? `${this._path}/${entry.name}` : entry.name,
-              this._directory,
-              entry.name
-            );
-          } else {
-            yield new FileSystemFileHandle(
-              this._path ? `${this._path}/${entry.name}` : entry.name,
-              this._directory,
-              entry.name
-            );
-          }
+      async *keys() {
+        for await (const [name] of this.entries()) {
+          yield name;
         }
-      } catch (err) {
-        console.error('[FS-Polyfill] 读取目录失败:', err);
+      }
+
+      async isSameEntry(other) {
+        return other instanceof FallbackDirectoryHandle &&
+          other._path === this._path &&
+          other._directory === this._directory;
+      }
+
+      [Symbol.asyncIterator]() {
+        return this.values();
       }
     }
 
-    async *entries() {
-      for await (const handle of this.values()) {
-        yield [handle.name, handle];
+    // 回退版全局 API（无原生选择器，仅操作 Documents 目录）
+    window.showDirectoryPicker = async function (options = {}) {
+      console.warn('[FS-Polyfill] 无原生目录选择器，返回 Documents 目录');
+      return new FallbackDirectoryHandle('', 'DOCUMENTS', 'Documents');
+    };
+
+    window.showOpenFilePicker = async function (options = {}) {
+      console.warn('[FS-Polyfill] 无原生文件选择器，尝试列出 Documents 目录文件');
+      const dir = new FallbackDirectoryHandle('', 'DOCUMENTS', 'Documents');
+      const files = [];
+      for await (const entry of dir.values()) {
+        if (entry.kind === 'file') files.push(entry);
       }
+      return files.slice(0, options.multiple ? undefined : 1);
+    };
+
+    window.showSaveFilePicker = async function (options = {}) {
+      const name = options.suggestedName || 'untitled.txt';
+      return new FallbackFileHandle(name, 'DOCUMENTS', name);
+    };
+
+    window.FileSystemFileHandle = FallbackFileHandle;
+    window.FileSystemDirectoryHandle = FallbackDirectoryHandle;
+
+    if (navigator.storage && !navigator.storage.getDirectory) {
+      navigator.storage.getDirectory = async function () {
+        return new FallbackDirectoryHandle('', 'DOCUMENTS', 'Documents');
+      };
     }
-
-    async *keys() {
-      for await (const [name] of this.entries()) {
-        yield name;
-      }
-    }
-
-    async isSameEntry(other) {
-      return other instanceof FileSystemDirectoryHandle &&
-        other._path === other._path &&
-        this._directory === other._directory;
-    }
-
-    [Symbol.asyncIterator]() {
-      return this.values();
-    }
-  }
-
-  // ============================================================
-  // showOpenFilePicker
-  // ============================================================
-
-  /**
-   * 在移动端，由于没有原生的文件选择器对话框，
-   * 使用 Capacitor 的方式来选择文件：
-   * 1. 先尝试使用 Capacitor Filepicker 插件
-   * 2. 回退到让用户从 Documents 目录中选择
-   */
-  async function showOpenFilePicker(options = {}) {
-    const { multiple = false, types = [], excludeAcceptAllOptions = false } = options;
-
-    console.log('[FS-Polyfill] showOpenFilePicker called', options);
-
-    // 尝试使用 Capacitor 的文件选择功能
-    // 由于 Capacitor 没有内置的文件选择器，我们使用 Share 插件的反向操作
-    // 或者使用自定义的文件浏览方式
-
-    try {
-      // 方案1: 使用 Capacitor Filesystem 浏览 Documents 目录
-      // 在移动端，我们展示一个目录浏览界面
-      const dirHandle = new FileSystemDirectoryHandle('', 'DOCUMENTS', 'Documents');
-
-      if (multiple) {
-        // 返回数组 - 简化实现：返回目录中的所有文件
-        const handles = [];
-        for await (const entry of dirHandle.values()) {
-          if (entry.kind === 'file') {
-            handles.push(entry);
-          }
-        }
-        return handles.length > 0 ? handles : [];
-      } else {
-        // 返回单个文件的数组
-        // 让用户选择 - 简化实现：返回第一个文件
-        for await (const entry of dirHandle.values()) {
-          if (entry.kind === 'file') {
-            return [entry];
-          }
-        }
-        throw new DOMException('No files found', 'NotFoundError');
-      }
-    } catch (err) {
-      if (err instanceof DOMException) throw err;
-      console.error('[FS-Polyfill] showOpenFilePicker 失败:', err);
-      throw new DOMException('User cancelled or no files selected', 'AbortError');
-    }
-  }
-
-  // ============================================================
-  // showSaveFilePicker
-  // ============================================================
-
-  async function showSaveFilePicker(options = {}) {
-    const { suggestedName = 'untitled.txt', types = [] } = options;
-
-    console.log('[FS-Polyfill] showSaveFilePicker called, suggestedName:', suggestedName);
-
-    try {
-      // 在移动端，文件保存到 Documents 目录
-      const path = suggestedName;
-      const handle = new FileSystemFileHandle(path, 'DOCUMENTS', suggestedName);
-      return handle;
-    } catch (err) {
-      console.error('[FS-Polyfill] showSaveFilePicker 失败:', err);
-      throw new DOMException('User cancelled', 'AbortError');
-    }
-  }
-
-  // ============================================================
-  // showDirectoryPicker
-  // ============================================================
-
-  async function showDirectoryPicker(options = {}) {
-    const { mode = 'read' } = options;
-
-    console.log('[FS-Polyfill] showDirectoryPicker called');
-
-    try {
-      // 在移动端，返回 Documents 目录作为根目录
-      const handle = new FileSystemDirectoryHandle('', 'DOCUMENTS', 'Documents');
-      return handle;
-    } catch (err) {
-      console.error('[FS-Polyfill] showDirectoryPicker 失败:', err);
-      throw new DOMException('User cancelled', 'AbortError');
-    }
-  }
-
-  // ============================================================
-  // 注册全局 API
-  // ============================================================
-
-  window.showOpenFilePicker = showOpenFilePicker;
-  window.showSaveFilePicker = showSaveFilePicker;
-  window.showDirectoryPicker = showDirectoryPicker;
-
-  // 注册 FileSystemFileHandle 和 FileSystemDirectoryHandle 到全局
-  if (!window.FileSystemFileHandle) {
-    window.FileSystemFileHandle = FileSystemFileHandle;
-  }
-  if (!window.FileSystemDirectoryHandle) {
-    window.FileSystemDirectoryHandle = FileSystemDirectoryHandle;
-  }
-  if (!window.FileSystemWritableFileStream) {
-    window.FileSystemWritableFileStream = FileSystemWritableFileStream;
   }
 
   // DataTransferItem.getAsFileSystemHandle polyfill
@@ -538,21 +492,20 @@
       if (this.kind === 'file') {
         const file = this.getAsFile();
         if (file) {
-          return new FileSystemFileHandle(file.name, 'DOCUMENTS', file.name);
+          if (useNativePicker) {
+            // SAF 模式下无法从 DataTransfer 获取 URI
+            console.warn('[FS-Polyfill] DataTransfer file access not supported with SAF');
+            return null;
+          }
+          return new (window.FileSystemFileHandle)(file.name, 'DOCUMENTS', file.name);
         }
       }
       return null;
     };
   }
 
-  // StorageManager.getDirectory polyfill
-  if (navigator.storage && !navigator.storage.getDirectory) {
-    navigator.storage.getDirectory = async function () {
-      return new FileSystemDirectoryHandle('', 'DOCUMENTS', 'Documents');
-    };
-  }
-
-  console.log('[FS-Polyfill] File System Access API Polyfill 已安装完成');
+  console.log('[FS-Polyfill] File System Access API Polyfill 已安装完成 (' +
+    (useNativePicker ? 'SAF 原生选择器' : 'Filesystem 回退') + ')');
 
   // 触发自定义事件，通知应用 polyfill 已就绪
   window.dispatchEvent(new CustomEvent('fs-polyfill-ready', {
@@ -560,6 +513,7 @@
       showOpenFilePicker: true,
       showSaveFilePicker: true,
       showDirectoryPicker: true,
+      nativePicker: useNativePicker,
     }
   }));
 
