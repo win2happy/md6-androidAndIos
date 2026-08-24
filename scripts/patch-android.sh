@@ -61,32 +61,9 @@ if [ -f "$MANIFEST_FILE" ]; then
         echo "  ✅ 添加 INTERNET 权限"
     fi
     
-    # 存储权限（Android 12 及以下）
-    if ! grep -q "READ_EXTERNAL_STORAGE" "$MANIFEST_FILE"; then
-        sed -i 's|</manifest>|    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n</manifest>|' "$MANIFEST_FILE"
-        echo "  ✅ 添加 READ_EXTERNAL_STORAGE 权限"
-    fi
-    
-    if ! grep -q "WRITE_EXTERNAL_STORAGE" "$MANIFEST_FILE"; then
-        sed -i 's|</manifest>|    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />\n</manifest>|' "$MANIFEST_FILE"
-        echo "  ✅ 添加 WRITE_EXTERNAL_STORAGE 权限"
-    fi
-    
-    # Android 13+ 细化媒体权限
-    if ! grep -q "READ_MEDIA_IMAGES" "$MANIFEST_FILE"; then
-        sed -i 's|</manifest>|    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />\n</manifest>|' "$MANIFEST_FILE"
-        echo "  ✅ 添加 READ_MEDIA_IMAGES 权限"
-    fi
-    
-    if ! grep -q "READ_MEDIA_VIDEO" "$MANIFEST_FILE"; then
-        sed -i 's|</manifest>|    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />\n</manifest>|' "$MANIFEST_FILE"
-        echo "  ✅ 添加 READ_MEDIA_VIDEO 权限"
-    fi
-    
-    if ! grep -q "READ_MEDIA_AUDIO" "$MANIFEST_FILE"; then
-        sed -i 's|</manifest>|    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />\n</manifest>|' "$MANIFEST_FILE"
-        echo "  ✅ 添加 READ_MEDIA_AUDIO 权限"
-    fi
+    # SAF 文件选择器不需要 READ/WRITE_EXTERNAL_STORAGE 权限
+    # SAF 通过 ACTION_OPEN_DOCUMENT_TREE Intent 启动系统选择器
+    # 用户授权后通过 takePersistableUriPermission 获取持久化访问权限
     
     # 通知权限（Android 13+）
     if ! grep -q "POST_NOTIFICATIONS" "$MANIFEST_FILE"; then

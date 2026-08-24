@@ -36,21 +36,7 @@ import java.io.OutputStream;
  * 支持通过 content URI 读写文件，持久化 URI 权限
  */
 @CapacitorPlugin(
-    name = "FSAccess",
-    permissions = {
-        @Permission(
-            strings = { "android.permission.READ_EXTERNAL_STORAGE" },
-            alias = "read"
-        ),
-        @Permission(
-            strings = { "android.permission.WRITE_EXTERNAL_STORAGE" },
-            alias = "write"
-        ),
-        @Permission(
-            strings = { "android.permission.POST_NOTIFICATIONS" },
-            alias = "notifications"
-        )
-    }
+    name = "FSAccess"
 )
 public class FSAccessPlugin extends Plugin {
 
@@ -318,19 +304,14 @@ public class FSAccessPlugin extends Plugin {
     }
 
     // ============================================================
-    // requestPermissions - 请求所有必要权限
+    // requestAllPermissions - SAF 不需要运行时权限
     // ============================================================
 
     @PluginMethod
     public void requestAllPermissions(PluginCall call) {
-        // 请求所有已声明的权限别名
-        requestPermissionForAlias("read", call, "permissionCallback");
-        requestPermissionForAlias("write", call, "permissionCallback");
-        requestPermissionForAlias("notifications", call, "permissionCallback");
-    }
-
-    @PluginMethod
-    public void permissionCallback(PluginCall call) {
+        // SAF 通过 ACTION_OPEN_DOCUMENT_TREE Intent 启动系统选择器
+        // 用户授权后通过 takePersistableUriPermission 获取访问权限
+        // 不需要 READ/WRITE_EXTERNAL_STORAGE 运行时权限
         call.resolve();
     }
 
