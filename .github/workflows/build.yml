@@ -53,7 +53,7 @@ jobs:
       - name: 📦 设置 Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: '24'
 
       - name: 📦 设置 JDK
         uses: actions/setup-java@v4
@@ -79,6 +79,7 @@ jobs:
           chmod +x scripts/patch-android.sh
           bash scripts/patch-android.sh
 
+      # ---- Debug 构建 ----
       - name: 🔨 构建 Android Debug APK
         if: github.event.inputs.release_type != 'release'
         working-directory: android
@@ -86,17 +87,28 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --stacktrace
 
+      # ---- Release 构建（带签名）----
+      - name: 🔑 解码 Android 签名密钥
+        if: github.event.inputs.release_type == 'release'
+        working-directory: android
+        run: |
+          # 从 secrets 解码 keystore
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 --decode > app/release.keystore
+          
+          # 创建 local.properties 配置签名
+          cat > app/keystore.properties << EOF
+          storeFile=release.keystore
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
       - name: 🔨 构建 Android Release APK
         if: github.event.inputs.release_type == 'release'
         working-directory: android
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease --stacktrace
-        env:
-          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
       - name: 📤 上传 Android APK
         uses: actions/upload-artifact@v4
@@ -165,6 +177,7 @@ jobs:
         working-directory: ios/App
         run: pod install
 
+      # ---- Debug 构建 ----
       - name: 🔨 构建 iOS IPA (Debug)
         if: github.event.inputs.release_type != 'release'
         working-directory: ios/App
@@ -188,6 +201,7 @@ jobs:
           zip -r md6-debug.ipa Payload/
           cd ../..
 
+      # ---- Release 构建（带签名）----
       - name: 🔨 构建 iOS IPA (Release)
         if: github.event.inputs.release_type == 'release'
         working-directory: ios/App
@@ -251,3 +265,130 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### IPA 文件" >> $GITHUB_STEP_SUMMARY
           find ios/App/build/ipa -name "*.ipa" -exec echo "- {}" \; >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "未找到 IPA 文件" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # Release 发布 Job
+  # ============================================================
+  release:
+    name: 🚀 Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-android, build-ios]
+    if: always() && (needs.build-android.result == 'success' || needs.build-ios.result == 'success')
+    # 仅在 push 到 main/master 时自动发布，PR 不发布
+    permissions:
+      contents: write
+
+    steps:
+      - name: 📥 Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 📅 生成版本号
+        id: version
+        run: |
+          # 版本号格式: v1.0.0-20240101 或 v1.0.0-20240101-abc1234
+          DATE=$(date +'%Y%m%d')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BUILD_TYPE="${{ github.event.inputs.release_type || 'debug' }}"
+          
+          if [ "$BUILD_TYPE" = "release" ]; then
+            VERSION="v1.0.0-${DATE}"
+          else
+            VERSION="v1.0.0-dev.${DATE}-${SHORT_SHA}"
+          fi
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_type=${BUILD_TYPE}" >> $GITHUB_OUTPUT
+          echo "📌 版本号: ${VERSION}"
+
+      - name: 📥 下载 Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: md6-android-apk
+          path: release/android
+        continue-on-error: true
+
+      - name: 📥 下载 iOS IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: md6-ios-ipa
+          path: release/ios
+        continue-on-error: true
+
+      - name: 📁 整理发布文件
+        run: |
+          mkdir -p release/upload
+          
+          # 重命名 APK 文件，添加版本号
+          if [ -d "release/android" ]; then
+            for apk in release/android/*.apk; do
+              if [ -f "$apk" ]; then
+                base=$(basename "$apk" .apk)
+                cp "$apk" "release/upload/MD6-${base}-${{ steps.version.outputs.version }}.apk"
+              fi
+            done
+          fi
+          
+          # 重命名 IPA 文件，添加版本号
+          if [ -d "release/ios" ]; then
+            for ipa in release/ios/*.ipa; do
+              if [ -f "$ipa" ]; then
+                base=$(basename "$ipa" .ipa)
+                cp "$ipa" "release/upload/MD6-${base}-${{ steps.version.outputs.version }}.ipa"
+              fi
+            done
+          fi
+          
+          # 列出将要上传的文件
+          echo "📦 发布文件列表:"
+          ls -la release/upload/ 2>/dev/null || echo "没有文件可发布"
+
+      - name: 🚀 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: "MD6 ${{ steps.version.outputs.version }}"
+          body: |
+            ## MD6 App ${{ steps.version.outputs.version }}
+            
+            **构建类型**: ${{ steps.version.outputs.build_type }}
+            **构建日期**: ${{ steps.version.outputs.date }}
+            **提交**: ${{ steps.version.outputs.sha }}
+            
+            ### 📱 下载
+            
+            | 平台 | 文件 | 说明 |
+            |------|------|------|
+            | Android | `.apk` 文件 | 直接安装到 Android 设备 |
+            | iOS | `.ipa` 文件 | 需通过 AltStore 等工具侧载安装 |
+            
+            ### ⚡ 更新内容
+            
+            - FSAccess 原生插件：使用 SAF/UIDocumentPicker 实现真正的文件选择器
+            - 运行时权限请求：存储权限 + 通知权限
+            - showDirectoryPicker 现在会弹出系统目录选择器
+            - showOpenFilePicker 现在会弹出系统文件选择器
+            - showSaveFilePicker 现在会弹出系统保存对话框
+            
+            > 💡 Android 首次安装后，请在设置中授予存储和通知权限。
+          draft: false
+          prerelease: ${{ steps.version.outputs.build_type == 'debug' }}
+          files: release/upload/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 输出发布信息
+        run: |
+          echo "## 🚀 Release 发布结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 版本号 | ${{ steps.version.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 构建类型 | ${{ steps.version.outputs.build_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 标签 | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 发布文件" >> $GITHUB_STEP_SUMMARY
+          ls release/upload/ 2>/dev/null | while read f; do echo "- $f" >> $GITHUB_STEP_SUMMARY; done || echo "无文件" >> $GITHUB_STEP_SUMMARY
