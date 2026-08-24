@@ -323,7 +323,15 @@ public class FSAccessPlugin extends Plugin {
 
     @PluginMethod
     public void requestAllPermissions(PluginCall call) {
-        requestAllPermissions(call);
+        // 请求所有已声明的权限别名
+        requestPermissionForAlias("read", call, "permissionCallback");
+        requestPermissionForAlias("write", call, "permissionCallback");
+        requestPermissionForAlias("notifications", call, "permissionCallback");
+    }
+
+    @PluginMethod
+    public void permissionCallback(PluginCall call) {
+        call.resolve();
     }
 
     // ============================================================
