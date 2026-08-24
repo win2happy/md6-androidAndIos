@@ -1,0 +1,255 @@
+name: Build MD6 App
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      build_android:
+        description: 'Build Android APK'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      build_ios:
+        description: 'Build iOS IPA'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      release_type:
+        description: 'Release type'
+        required: false
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+env:
+  NODE_VERSION: '20'
+  JAVA_VERSION: '17'
+  CAPACITOR_CLI_VERSION: '^6.0.0'
+
+# ============================================================
+# Android 构建 Job
+# ============================================================
+jobs:
+  build-android:
+    name: 🤖 Build Android APK
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_android == 'true'
+
+    steps:
+      - name: 📥 Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 📦 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 设置 JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 📦 设置 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 📥 安装依赖
+        run: npm install
+
+      - name: 🔧 添加 Android 平台
+        run: npx cap add android
+        continue-on-error: true
+
+      - name: 🔄 同步 Capacitor
+        run: npx cap sync android
+
+      - name: 🩹 应用 Android 原生补丁
+        run: |
+          chmod +x scripts/patch-android.sh
+          bash scripts/patch-android.sh
+
+      - name: 🔨 构建 Android Debug APK
+        if: github.event.inputs.release_type != 'release'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: 🔨 构建 Android Release APK
+        if: github.event.inputs.release_type == 'release'
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: 📤 上传 Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: md6-android-apk
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: 📋 输出构建信息
+        run: |
+          echo "## 🤖 Android 构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 构建类型 | ${{ github.event.inputs.release_type || 'debug' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Node.js | ${{ env.NODE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Java | ${{ env.JAVA_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Capacitor | ${{ env.CAPACITOR_CLI_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### APK 文件" >> $GITHUB_STEP_SUMMARY
+          find android/app/build/outputs/apk -name "*.apk" -exec echo "- {}" \; >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "未找到 APK 文件" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # iOS 构建 Job
+  # ============================================================
+  build-ios:
+    name: 🍎 Build iOS IPA
+    runs-on: macos-14
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_ios == 'true'
+
+    steps:
+      - name: 📥 Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 📦 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 设置 Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '15'
+
+      - name: 📥 安装依赖
+        run: npm install
+
+      - name: 📦 安装 CocoaPods
+        run: gem install cocoapods
+
+      - name: 🔧 添加 iOS 平台
+        run: npx cap add ios
+        continue-on-error: true
+
+      - name: 🔄 同步 Capacitor
+        run: npx cap sync ios
+
+      - name: 🩹 应用 iOS 原生补丁
+        run: |
+          chmod +x scripts/patch-ios.sh
+          bash scripts/patch-ios.sh
+
+      - name: 🔨 安装 iOS Pods
+        working-directory: ios/App
+        run: pod install
+
+      - name: 🔨 构建 iOS IPA (Debug)
+        if: github.event.inputs.release_type != 'release'
+        working-directory: ios/App
+        run: |
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Debug \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/App.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | xcpretty
+
+          # 创建 IPA（Debug 模式不需要签名）
+          mkdir -p build/ipa/Payload
+          cp -r build/App.xcarchive/Products/Applications/App.app build/ipa/Payload/
+          cd build/ipa
+          zip -r md6-debug.ipa Payload/
+          cd ../..
+
+      - name: 🔨 构建 iOS IPA (Release)
+        if: github.event.inputs.release_type == 'release'
+        working-directory: ios/App
+        run: |
+          # Release 构建需要签名证书和配置文件
+          # 解码证书
+          echo "${{ secrets.IOS_P12_BASE64 }}" | base64 --decode > /tmp/certificate.p12
+
+          # 导入证书到钥匙串
+          security create-keychain -p actions temp.keychain
+          security import /tmp/certificate.p12 -t agg -k temp.keychain -P "${{ secrets.IOS_P12_PASSWORD }}" -A
+          security list-keychains -s temp.keychain
+          security unlock-keychain -p actions temp.keychain
+
+          # 设置配置文件
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.IOS_PROVISION_BASE64 }}" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/App.xcarchive \
+            archive \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="profile" \
+            DEVELOPMENT_TEAM="${{ secrets.IOS_TEAM_ID }}" \
+            | xcpretty
+
+          # 导出 IPA
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/App.xcarchive \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/ipa \
+            | xcpretty
+
+          # 清理
+          security delete-keychain temp.keychain
+          rm -f /tmp/certificate.p12
+
+      - name: 📤 上传 iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: md6-ios-ipa
+          path: |
+            ios/App/build/ipa/*.ipa
+          retention-days: 30
+
+      - name: 📋 输出构建信息
+        run: |
+          echo "## 🍎 iOS 构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 构建类型 | ${{ github.event.inputs.release_type || 'debug' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Node.js | ${{ env.NODE_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Xcode | 15 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Capacitor | ${{ env.CAPACITOR_CLI_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### IPA 文件" >> $GITHUB_STEP_SUMMARY
+          find ios/App/build/ipa -name "*.ipa" -exec echo "- {}" \; >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "未找到 IPA 文件" >> $GITHUB_STEP_SUMMARY

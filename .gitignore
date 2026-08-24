@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Capacitor
+android/app/build/
+ios/Pods/
+ios/App.xcworkspace/
+ios/App/Pods/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Gradle
+.gradle/
+android/.gradle/
+android/build/
+
+# Xcode
+*.xcuserdata
+*.xcworkspace
+!ios/App.xcworkspace
+xcuserdata/
+
+# CocoaPods
+ios/Pods/
+
+# APK/IPA
+*.apk
+*.aab
+*.ipa
