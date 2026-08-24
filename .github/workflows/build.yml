@@ -33,7 +33,7 @@ on:
           - release
 
 env:
-  NODE_VERSION: '20'
+  NODE_VERSION: '24'
   JAVA_VERSION: '17'
   CAPACITOR_CLI_VERSION: '^6.0.0'
 
@@ -54,7 +54,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
 
       - name: 📦 设置 JDK
         uses: actions/setup-java@v4
@@ -138,7 +137,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
 
       - name: 📦 设置 Xcode
         uses: maxim-lobanov/setup-xcode@v1
